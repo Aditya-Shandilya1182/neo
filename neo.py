@@ -80,3 +80,29 @@ class Neo(nn.Module):
             ln_f = nn.LayerNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+    def forward(self, idx):
+        B, T = idx.size()
+        assert T <= self.config.block_size, f"Cannot forward"
+
+        pos = torch.arange(0, T, dtype = torch.long, device = idx.device)
+        pos_emb = self.transformer.wpe(pos)
+        tok_emb = self.transformer.wte(idx)
+        x = pos_emb + tok_emb
+
+        for block in self.transformer.h:
+            x = block(x)
+
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x)
+        return logits
+
+with open('input.txt', 'r') as f:
+    text = f.read()
+
+
+import tiktoken
+enc = tiktoken.get_encoding('gpt-2')
+tokens = enc.encode(data)
+
+        
