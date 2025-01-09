@@ -1,108 +1,139 @@
-from dataclasses import dataclass
-import math
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from dataclasses import dataclass
+from utils import apply_rotary_emb, precompute_freqs_cis, reshape_for_broadcast
 
-class CasualSelfAttention(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        assert config.n_embd % config.n_head == 0
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                             .view(1, 1, config.block_size, config.block_size))
-        
-    def forward(self, x):
-        B, T, C = x.size()
+class RMSNorm(nn.Module):
+  def __init__(self, dim, norm_eps):
+    super().__init__()
+    self.norm_eps = norm_eps
+    self.weight = nn.Parameter(torch.ones(dim))
 
-        qkv = self.c_attn(x)
-        q, k, v = qkv.split(self.n_embd, dim=2)
+  def _norm(self, x):
+    return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.norm_eps)
 
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) 
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) 
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-
-        y = att @ v
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
-        y = self.c_proj(y)
-        return y
-
+  def forward(self, x):
+    out = self._norm(x.float()).type_as(x)
+    return out * self.weight
+  
 class MLP(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
-        self.gelu = nn.GELU(approximate='tanh')
-        self.c_proj == nn.Linear(4 * config.n_embd, config.n_embd)
+  def __init__(self, config):
+    super().__init__()
+    self.w1 = nn.Linear(config.embd, config.hidden_dim, bias=False)
+    self.w2 = nn.Linear(config.hidden_dim, config.embd, bias=False)
+    self.w3 = nn.Linear(config.embd, config.hidden_dim, bias=False)
 
-    def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
-        return x
+  def forward(self, x):
+    x_w1 = self.w1(x)
+    x_w3 = self.w3(x)
+    x = F.silu(x_w1) * x_w3
+    x = self.w2(x)
+    return x
+
+class Attention(nn.Module):
+  def __init__(self, config):
+    super().__init__()
+
+    self.wq = nn.Linear(config.embd, config.n_heads * config.head_dim, bias=False)
+    self.wk = nn.Linear(config.embd, config.n_kv_head * config.head_dim, bias=False)
+    self.wv = nn.Linear(config.embd, config.n_kv_head * config.head_dim, bias=False)
+    self.wo = nn.Linear(config.n_heads * config.head_dim, config.embd, bias=False)
+
+    self.cache_k = torch.zeros((config.batch_size, config.seq_len, config.n_kv_head, config.head_dim))
+    self.cache_v = torch.zeros((config.batch_size, config.seq_len, config.n_kv_head, config.head_dim))
+
+    self.n_heads = config.n_heads
+    self.head_dim = config.head_dim
+    self.n_kv_head = config.n_kv_head
+    self.n_kv_head_rep = config.n_kv_head_rep
+
+  def forward(self, x, start_pos, freqs_cis, mask):
+    batch_sz, seqlen, _ = x.shape
+
+    queries = self.wq(x)
+    keys = self.wk(x)
+    values = self.wv(x)
+
+    queries = queries.view(batch_sz, seqlen, self.n_heads, self.head_dim)
+    keys = keys.view(batch_sz, seqlen, self.n_kv_head, self.head_dim)
+    values = values.view(batch_sz, seqlen, self.n_kv_head, self.head_dim)
+
+    queries, keys = apply_rotary_emb(queries, keys, freqs_cis)
+
+    self.cache_k = self.cache_k.to(queries.device)
+    self.cache_v = self.cache_v.to(queries.device)
+
+    self.cache_k[:batch_sz, start_pos : start_pos + seqlen] = keys
+    self.cache_v[:batch_sz, start_pos : start_pos + seqlen] = values
+
+    keys = self.cache_k[:batch_sz, : start_pos + seqlen]
+    values = self.cache_v[:batch_sz, : start_pos + seqlen]
+
+    keys = torch.repeat_interleave(keys, dim=2, repeats=self.n_kv_head_rep)
+    values = torch.repeat_interleave(values, dim=2, repeats=self.n_kv_head_rep)
+
+    queries = queries.transpose(1, 2)
+    keys = keys.transpose(1, 2)
+    values = values.transpose(1, 2)
+
+    out = F.scaled_dot_product_attention(queries, keys, values, attn_mask=mask)
+    out = out.transpose(1, 2).contiguous().view(batch_sz, seqlen, -1)
+    return self.wo(out)
 
 class Block(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.ln_1 = nn.LayerNorm(config.n_embd)
-        self.attn = CasualSelfAttention(config)
-        self.ln_2 = nn.LayerNorm(config.n_embd)
-        self.mlp = MLP(config)
+  def __init__(self, config):
+    super().__init__()
+    self.attention = Attention(config)
+    self.feed_forward = MLP(config)
+    self.attention_norm = RMSNorm(config.embd, config.norm_eps)
+    self.ffn_norm = RMSNorm(config.embd, config.norm_eps)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
-        return x
+  def forward(self, x, start_pos, freqs_cis, mask):
+     x = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
+     x = x + self.feed_forward(self.ffn_norm(x))
+     return x
+
+class Neo(nn.Module):
+  def __init__(self, config):
+    super().__init__()
+    self.tok_embeddings = nn.Embedding(config.vocab_size, config.embd)
+    self.layers = nn.ModuleList()
+    for _ in range(config.n_layers):
+      self.layers.append(Block(config))
+    self.norm = RMSNorm(config.embd, config.norm_eps)
+    self.output = nn.Linear(config.embd, config.vocab_size, bias=False)
+    self.freq_cis = precompute_freqs_cis(config.head_dim, config.seq_len * 2, config.theta)
+
+  @torch.inference_mode()
+  def forward(self, tokens, start_pos):
+    bsz, seqlen = tokens.shape
+    h = self.tok_embeddings(tokens)
+    self.freqs_cis = self.freqs_cis.to(tokens.device)
+    freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+    mask = None
+    if seqlen > 1:
+      mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device)
+
+      mask = torch.triu(mask, diagonal=1).to(tokens.device)
+
+    for layer in self.layers:
+      h = layer(h, start_pos, freqs_cis, mask)
+    h = self.norm(h)
+    out = self.output(h).float()
+    return out
 
 @dataclass
 class ModelConfig:
-    block_size: int = 1024
-    vocab_size: int = 50257
-    n_layer: int = 12
-    n_head: int = 12
-    n_embd: int = 768
+  embd: int = 4096
+  hidden_dim: int = 14336
+  n_heads: int = 32
+  head_dim: int = embd // n_heads
+  n_kv_heads: int = 8
+  vocab_size: int = 128256
+  n_layers: int = 32
+  norm_eps: int = 1e-5
+  theta: int = 500000
+  seq_len: int = 128
+  n_kv_heads_rep: int = n_heads // n_kv_heads
 
-class Neo(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-
-        self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
-            ln_f = nn.LayerNorm(config.n_embd),
-        ))
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-
-    def forward(self, idx):
-        B, T = idx.size()
-        assert T <= self.config.block_size, f"Cannot forward"
-
-        pos = torch.arange(0, T, dtype = torch.long, device = idx.device)
-        pos_emb = self.transformer.wpe(pos)
-        tok_emb = self.transformer.wte(idx)
-        x = pos_emb + tok_emb
-
-        for block in self.transformer.h:
-            x = block(x)
-
-        x = self.transformer.ln_f(x)
-        logits = self.lm_head(x)
-        return logits
-
-with open('input.txt', 'r') as f:
-    text = f.read()
-
-
-import tiktoken
-enc = tiktoken.get_encoding('gpt-2')
-tokens = enc.encode(data)
-
-        
