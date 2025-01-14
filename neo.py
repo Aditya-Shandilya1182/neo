@@ -1,14 +1,9 @@
 import torch
-import tiktoken
-from tiktoken import get_encoding
 import torch.nn as nn
 from torch.nn import functional as F
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
 from dataclasses import dataclass
-from datasets import load_dataset
-from tqdm import tqdm
-import pickle
 
 
 class MLP(nn.Module):
@@ -120,3 +115,18 @@ class Neo(nn.Module):
             index_next = torch.multinomial(probs, num_samples=1)
             index = torch.cat((index, index_next), dim=1)
         return index
+
+class ModelConfig:
+    batch_size: int = 8  
+    block_size: int = 512  
+    max_iters: int = 10000  
+    learning_rate: float = 1e-4  
+    eval_iters: int = 500  
+    n_embd: int = 512  
+    n_head: int = 8  
+    n_layer: int = 12  
+    head_size: int = 512
+    d_type: torch.dtype = torch.float32
+    vocab_size: int = 50257
+    dropout: float = 0.1  
+    device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
