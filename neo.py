@@ -1,139 +1,122 @@
 import torch
+import tiktoken
+from tiktoken import get_encoding
 import torch.nn as nn
 from torch.nn import functional as F
+from torch.optim import AdamW
+from torch.utils.data import DataLoader, Dataset
 from dataclasses import dataclass
-from utils import apply_rotary_emb, precompute_freqs_cis, reshape_for_broadcast
+from datasets import load_dataset
+from tqdm import tqdm
+import pickle
 
-class RMSNorm(nn.Module):
-  def __init__(self, dim, norm_eps):
-    super().__init__()
-    self.norm_eps = norm_eps
-    self.weight = nn.Parameter(torch.ones(dim))
 
-  def _norm(self, x):
-    return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.norm_eps)
-
-  def forward(self, x):
-    out = self._norm(x.float()).type_as(x)
-    return out * self.weight
-  
 class MLP(nn.Module):
-  def __init__(self, config):
-    super().__init__()
-    self.w1 = nn.Linear(config.embd, config.hidden_dim, bias=False)
-    self.w2 = nn.Linear(config.hidden_dim, config.embd, bias=False)
-    self.w3 = nn.Linear(config.embd, config.hidden_dim, bias=False)
+    def __init__(self, config):
+        super().__init__()
+        self.w1 = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False, dtype=config.d_type)
+        self.w2 = nn.Linear(4 * config.n_embd, config.n_embd, bias=False, dtype=config.d_type)
+        self.dropout = nn.Dropout(config.dropout)
 
-  def forward(self, x):
-    x_w1 = self.w1(x)
-    x_w3 = self.w3(x)
-    x = F.silu(x_w1) * x_w3
-    x = self.w2(x)
-    return x
+    def forward(self, x):
+        x_w1 = self.w1(x)
+        x = F.silu(x_w1)
+        x = self.w2(x)
+        x = self.dropout(x)
+        return x
+
 
 class Attention(nn.Module):
-  def __init__(self, config):
-    super().__init__()
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0, "Embedding size must be divisible by the number of heads"
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False, dtype=config.d_type)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False, dtype=config.d_type)
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.register_buffer(
+            "tril",
+            torch.tril(torch.ones(config.block_size,
+                       config.block_size, dtype=torch.bool))
+        )
+        self.att_dropout = nn.Dropout(config.dropout)
+        self.dropout = config.dropout
 
-    self.wq = nn.Linear(config.embd, config.n_heads * config.head_dim, bias=False)
-    self.wk = nn.Linear(config.embd, config.n_kv_head * config.head_dim, bias=False)
-    self.wv = nn.Linear(config.embd, config.n_kv_head * config.head_dim, bias=False)
-    self.wo = nn.Linear(config.n_heads * config.head_dim, config.embd, bias=False)
+    def forward(self, x):
+        B, T, C = x.size()
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        y = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=None, dropout_p=self.dropout, is_causal=True)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        y = self.c_proj(y)
+        y = self.att_dropout(y)
+        return y
 
-    self.cache_k = torch.zeros((config.batch_size, config.seq_len, config.n_kv_head, config.head_dim))
-    self.cache_v = torch.zeros((config.batch_size, config.seq_len, config.n_kv_head, config.head_dim))
-
-    self.n_heads = config.n_heads
-    self.head_dim = config.head_dim
-    self.n_kv_head = config.n_kv_head
-    self.n_kv_head_rep = config.n_kv_head_rep
-
-  def forward(self, x, start_pos, freqs_cis, mask):
-    batch_sz, seqlen, _ = x.shape
-
-    queries = self.wq(x)
-    keys = self.wk(x)
-    values = self.wv(x)
-
-    queries = queries.view(batch_sz, seqlen, self.n_heads, self.head_dim)
-    keys = keys.view(batch_sz, seqlen, self.n_kv_head, self.head_dim)
-    values = values.view(batch_sz, seqlen, self.n_kv_head, self.head_dim)
-
-    queries, keys = apply_rotary_emb(queries, keys, freqs_cis)
-
-    self.cache_k = self.cache_k.to(queries.device)
-    self.cache_v = self.cache_v.to(queries.device)
-
-    self.cache_k[:batch_sz, start_pos : start_pos + seqlen] = keys
-    self.cache_v[:batch_sz, start_pos : start_pos + seqlen] = values
-
-    keys = self.cache_k[:batch_sz, : start_pos + seqlen]
-    values = self.cache_v[:batch_sz, : start_pos + seqlen]
-
-    keys = torch.repeat_interleave(keys, dim=2, repeats=self.n_kv_head_rep)
-    values = torch.repeat_interleave(values, dim=2, repeats=self.n_kv_head_rep)
-
-    queries = queries.transpose(1, 2)
-    keys = keys.transpose(1, 2)
-    values = values.transpose(1, 2)
-
-    out = F.scaled_dot_product_attention(queries, keys, values, attn_mask=mask)
-    out = out.transpose(1, 2).contiguous().view(batch_sz, seqlen, -1)
-    return self.wo(out)
 
 class Block(nn.Module):
-  def __init__(self, config):
-    super().__init__()
-    self.attention = Attention(config)
-    self.feed_forward = MLP(config)
-    self.attention_norm = RMSNorm(config.embd, config.norm_eps)
-    self.ffn_norm = RMSNorm(config.embd, config.norm_eps)
+    def __init__(self, config):
+        super().__init__()
+        self.attention = Attention(config)
+        self.feed_forward = MLP(config)
+        self.attention_norm = nn.RMSNorm(config.n_embd, dtype=config.d_type)
+        self.ffn_norm = nn.RMSNorm(config.n_embd, dtype=config.d_type)
 
-  def forward(self, x, start_pos, freqs_cis, mask):
-     x = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
-     x = x + self.feed_forward(self.ffn_norm(x))
-     return x
+    def forward(self, x):
+        x = x + self.attention(self.attention_norm(x))
+        x = x + self.feed_forward(self.ffn_norm(x))
+        return x
+
 
 class Neo(nn.Module):
-  def __init__(self, config):
-    super().__init__()
-    self.tok_embeddings = nn.Embedding(config.vocab_size, config.embd)
-    self.layers = nn.ModuleList()
-    for _ in range(config.n_layers):
-      self.layers.append(Block(config))
-    self.norm = RMSNorm(config.embd, config.norm_eps)
-    self.output = nn.Linear(config.embd, config.vocab_size, bias=False)
-    self.freq_cis = precompute_freqs_cis(config.head_dim, config.seq_len * 2, config.theta)
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.token_embedding = nn.Embedding(config.vocab_size, config.n_embd, dtype=config.d_type)
+        self.position_embedding = nn.Embedding(config.block_size, config.n_embd, dtype=config.d_type)
+        self.blocks = nn.Sequential(*[Block(config) for _ in range(config.n_layer)])
+        self.ln_f = nn.RMSNorm(config.n_embd, dtype=config.d_type)
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, dtype=config.d_type)
+        self.apply(self._init_weights)
 
-  @torch.inference_mode()
-  def forward(self, tokens, start_pos):
-    bsz, seqlen = tokens.shape
-    h = self.tok_embeddings(tokens)
-    self.freqs_cis = self.freqs_cis.to(tokens.device)
-    freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
-    mask = None
-    if seqlen > 1:
-      mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device)
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-      mask = torch.triu(mask, diagonal=1).to(tokens.device)
+    def forward(self, index, targets=None):
+        B, T = index.shape
 
-    for layer in self.layers:
-      h = layer(h, start_pos, freqs_cis, mask)
-    h = self.norm(h)
-    out = self.output(h).float()
-    return out
+        tok_emb = self.token_embedding(index)
+        pos_emb = self.position_embedding(
+            torch.arange(T, device=self.config.device))
+        x = tok_emb + pos_emb
+        x = self.blocks(x)
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
 
-@dataclass
-class ModelConfig:
-  embd: int = 4096
-  hidden_dim: int = 14336
-  n_heads: int = 32
-  head_dim: int = embd // n_heads
-  n_kv_heads: int = 8
-  vocab_size: int = 128256
-  n_layers: int = 32
-  norm_eps: int = 1e-5
-  theta: int = 500000
-  seq_len: int = 128
-  n_kv_heads_rep: int = n_heads // n_kv_heads
+        if targets is None:
+            loss = None
+        else:
+            B, T, C = logits.shape
+            logits = logits.view(B*T, C)
+            targets = targets.view(B*T)
+            loss = F.cross_entropy(logits, targets)
 
+        return logits, loss
+
+    def generate(self, index, max_new_tokens):
+        for _ in range(max_new_tokens):
+            b_s = self.config.block_size
+            index_cond = index[:, -b_s:]
+            logits, loss = self.forward(index_cond)
+            logits = logits[:, -1, :]
+            probs = F.softmax(logits, dim=-1)
+            index_next = torch.multinomial(probs, num_samples=1)
+            index = torch.cat((index, index_next), dim=1)
+        return index
